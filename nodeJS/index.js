@@ -32,7 +32,10 @@ const CONFIG = {
     SB_MASS_PROXY: process.env.SB_MASS_PROXY || "https://www.gstatic.com",
     SB_DOMAIN: process.env.SB_DOMAIN || process.env.DOMAIN,
     SB_HOST: process.env.SB_HOST || "127.0.0.1",
-    SB_OBFS_PWD: process.env.SB_OBFS_PWD || Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2)
+    SB_OBFS_PWD: process.env.SB_OBFS_PWD || Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2),
+    
+    // VLESS WS settings (same port as Hysteria2)
+    VLESS_PATH: process.env.VLESS_PATH || Math.random().toString(36).slice(2, 15) + '-' + Math.random().toString(36).slice(2, 15)
 };
 
 // ========== CONSTANTS ==========
@@ -433,6 +436,22 @@ class SbManager {
                     "ignore_client_bandwidth": false,
                     "up_mbps": 100,
                     "down_mbps": 100
+                },
+                {
+                    "type": "vless",
+                    "tag": "vless-ws-in",
+                    "listen": "::",
+                    "listen_port": CONFIG.SB_PORT,
+                    "users": [
+                        {
+                            "uuid": CONFIG.SB_UUID
+                        }
+                    ],
+                    "transport": {
+                        "type": "ws",
+                        "path": `/${CONFIG.VLESS_PATH}`,
+                        "max_early_data": 0
+                    }
                 }
             ],
             "outbounds": [
@@ -512,17 +531,22 @@ class SbManager {
      * Initialize sb service
      */
     static async initialize() {
-        Logger.header("SB CONFIGURATION");
+        Logger.header("SB + VLESS WS CONFIGURATION");
         
         // Display configuration
         Logger.config("Node Name", CONFIG.SB_NAME);
-        Logger.config("Port", CONFIG.SB_PORT);
+        Logger.config("Port (UDP+TCP)", CONFIG.SB_PORT);
         Logger.config("UUID", CONFIG.SB_UUID);
         Logger.config("SNI", CONFIG.SB_SNI);
         Logger.config("Domain", CONFIG.SB_DOMAIN || 'Not set');
         Logger.config("Fallback Host", CONFIG.SB_HOST);
         Logger.config("Version", CONFIG.SB_VERSION);
         Logger.config("Architecture", ARCH);
+        Logger.config("VLESS Path", CONFIG.VLESS_PATH);
+        Logger.info("");
+        Logger.info("Protocols enabled:");
+        Logger.info("  • Hysteria2 (UDP) - High performance QUIC-based protocol");
+        Logger.info("  • VLESS WebSocket (TCP) - Stealthy HTTP-like traffic");
 
         // Setup certificates
         const certs = this.ensureCertificates();
@@ -550,12 +574,16 @@ class SbManager {
         const serverHost = await this.getServerHost();
         const insecure = process.env.EXTERNAL_CERT ? "0" : "1";
 
-        const baseUrl = `hysteria2://${CONFIG.SB_UUID}@${serverHost}:${CONFIG.SB_PORT}/?sni=${CONFIG.SB_SNI}&obfs=salamander&obfs-password=${CONFIG.SB_OBFS_PWD}&insecure=${insecure}#${CONFIG.SB_NAME}-${isp}`;
-
-        state.sboxLinks = [baseUrl];
-        state.sboxBase64 = Buffer.from(baseUrl).toString('base64');
+        // Hysteria2 link (UDP)
+        const hy2Url = `hysteria2://${CONFIG.SB_UUID}@${serverHost}:${CONFIG.SB_PORT}/?sni=${CONFIG.SB_SNI}&obfs=salamander&obfs-password=${CONFIG.SB_OBFS_PWD}&insecure=${insecure}#${CONFIG.SB_NAME}-${isp}`;
         
-        return baseUrl;
+        // VLESS WS link (TCP) - same port as Hysteria2
+        const vlessWsUrl = `vless://${CONFIG.SB_UUID}@${serverHost}:${CONFIG.SB_PORT}?encryption=none&security=none&type=ws&path=/${CONFIG.VLESS_PATH}#${CONFIG.NAME}-vless-ws-${isp}`;
+
+        state.sboxLinks = [hy2Url, vlessWsUrl];
+        state.sboxBase64 = Buffer.from(state.sboxLinks.join('\n')).toString('base64');
+        
+        return hy2Url;
     }
 }
 
@@ -1252,6 +1280,10 @@ class HttpServer {
      * Generate sb configuration card
      */
     static generateSboxCard(links, base64) {
+        // Separate Hysteria2 and VLESS WS links
+        const hy2Links = links.filter(link => link.startsWith('hysteria2://'));
+        const vlessWsLinks = links.filter(link => link.startsWith('vless://') && link.includes('type=ws'));
+        
         return `
         <div class="card">
             <div class="card-header">
@@ -1259,24 +1291,38 @@ class HttpServer {
                     <i class="fas fa-rocket"></i>
                 </div>
                 <div>
-                    <div class="card-title">HY2 Protocol</div>
-                    <div class="card-subtitle">High-performance protocol</div>
+                    <div class="card-title">HY2 + VLESS WS</div>
+                    <div class="card-subtitle">Hysteria2 (UDP) + VLESS WS (TCP) on same port</div>
                 </div>
             </div>
 
-            <div class="protocol-badge">Connection Link</div>
-            ${links.length > 0 ? links.map(link => `
+            ${hy2Links.length > 0 ? `
+            <div class="protocol-badge">Hysteria2 Protocol (UDP)</div>
+            ${hy2Links.map(link => `
                 <div class="link-item">
                     <div class="link-content">${link}</div>
                     <button class="copy-btn" onclick="copyToClipboard('${link}', this)">
-                        <i class="fas fa-copy"></i> Copy
+                        <i class="fas fa-copy"></i> Copy HY2
                     </button>
                 </div>
-            `).join('') : '<div class="link-item"><div class="link-content">Links not generated yet</div></div>'}
+            `).join('')}
+            ` : ''}
+
+            ${vlessWsLinks.length > 0 ? `
+            <div class="protocol-badge" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">VLESS WebSocket (TCP)</div>
+            ${vlessWsLinks.map(link => `
+                <div class="link-item">
+                    <div class="link-content">${link}</div>
+                    <button class="copy-btn" onclick="copyToClipboard('${link}', this)" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
+                        <i class="fas fa-copy"></i> Copy VLESS WS
+                    </button>
+                </div>
+            `).join('')}
+            ` : ''}
 
             <div class="base64-section">
                 <div class="base64-title">
-                    <i class="fas fa-qrcode"></i> Base64 Configuration
+                    <i class="fas fa-qrcode"></i> Base64 Configuration (All Protocols)
                 </div>
                 ${base64 ? `
                     <div class="base64-content">${base64}</div>
@@ -1355,15 +1401,30 @@ class Application {
         console.log(`  ${COLORS.white}${state.xBase64}${COLORS.reset}`);
         
         if (state.sboxLinks.length > 0) {
-            console.log(`\n${COLORS.magenta}${COLORS.bright}⚡ HY2 LINKS:${COLORS.reset}`);
-            state.sboxLinks.forEach((link, index) => {
-                console.log(`  ${COLORS.cyan}${index + 1}.${COLORS.reset} ${COLORS.yellow}${link}${COLORS.reset}`);
-            });
+            console.log(`\n${COLORS.magenta}${COLORS.bright}⚡ HYSTERIA2 + VLESS WS LINKS:${COLORS.reset}`);
             
-            console.log(`\n${COLORS.blue}${COLORS.bright}🔗 HY2 BASE64:${COLORS.reset}`);
+            // Separate and display Hysteria2 links
+            const hy2Links = state.sboxLinks.filter(link => link.startsWith('hysteria2://'));
+            const vlessWsLinks = state.sboxLinks.filter(link => link.startsWith('vless://') && link.includes('type=ws'));
+            
+            if (hy2Links.length > 0) {
+                console.log(`\n${COLORS.green}${COLORS.bright}📡 Hysteria2 (UDP):${COLORS.reset}`);
+                hy2Links.forEach((link, index) => {
+                    console.log(`  ${COLORS.cyan}${index + 1}.${COLORS.reset} ${COLORS.yellow}${link}${COLORS.reset}`);
+                });
+            }
+            
+            if (vlessWsLinks.length > 0) {
+                console.log(`\n${COLORS.blue}${COLORS.bright}🔌 VLESS WebSocket (TCP):${COLORS.reset}`);
+                vlessWsLinks.forEach((link, index) => {
+                    console.log(`  ${COLORS.cyan}${index + 1}.${COLORS.reset} ${COLORS.yellow}${link}${COLORS.reset}`);
+                });
+            }
+            
+            console.log(`\n${COLORS.blue}${COLORS.bright}🔗 COMBINED BASE64 (All Protocols):${COLORS.reset}`);
             console.log(`  ${COLORS.white}${state.sboxBase64}${COLORS.reset}`);
         } else {
-            console.log(`\n${COLORS.yellow}${COLORS.bright}⚠ HY2 LINKS: Not available${COLORS.reset}`);
+            console.log(`\n${COLORS.yellow}${COLORS.bright}⚠ LINKS: Not available${COLORS.reset}`);
         }
         
         Logger.divider();

@@ -1,2 +1,5 @@
-flask
-requests
+# Xray-Sing (Python) uses the standard library only.
+# No pip packages required for Python 3.8+.
+#
+# Optional (not used by default):
+# requests>=2.28.0

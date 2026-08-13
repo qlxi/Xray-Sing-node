@@ -6,7 +6,7 @@ A collection of scripts to deploy high-performance proxy services on various hos
 
 ## 🚀 Features
 
-- **Dual Protocol Support**: Xray VLESS and SingBox Hysteria2
+- **Dual Protocol Support**: Xray VLESS and SingBox Hysteria2, VLESS WS
 - **Multi-Platform Deployment**: Node.js, Python, and Java environments
 
 ## 📋 Supported Protocols

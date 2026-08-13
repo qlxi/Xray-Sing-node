@@ -1,38 +1,57 @@
+/**
+ * Xray-Sing — Hysteria2 (UDP) + VLESS-WS (TCP) on one public port.
+ * Optional Cloudflare Argo. Panel: http://HOST:PORT/sub
+ * MIT License
+ */
 const express = require("express");
 const axios = require("axios");
-const os = require('os');
+const os = require("os");
 const fs = require("fs");
 const path = require("path");
-const { exec, execSync, spawn, spawnSync } = require('child_process');
+const net = require("net");
+const http = require("http");
+const crypto = require("crypto");
+const { exec, execSync, spawn, spawnSync } = require("child_process");
 
 // ========== CONFIGURATION ==========
+// Public port: TCP = HTTP panel + WS proxy; UDP = Hysteria2.
+// VLESS-WS is local-only; Express proxies WebSocket upgrades to it.
+const _publicPort = parseInt(process.env.SB_PORT || process.env.SERVER_PORT || process.env.PORT || "2705", 10);
+const _defaultUuid = process.env.UUID || crypto.randomUUID();
+
 const CONFIG = {
-    // X settings
-    UUID: process.env.UUID || '9afd1229-b893-40c1-84dd-51e7ce204913',
-    FILE_PATH: process.env.FILE_PATH || '/tmp/.cache',
-    SUB_PATH: process.env.SUB_PATH || 'sub',
-    PORT: process.env.SERVER_PORT || process.env.PORT || 3000,
-    NAME: process.env.NAME || 'vless',
-    
-    // CDN settings
-    CFIP: process.env.CFIP || 'www.kick.com',
-    CFPORT: process.env.CFPORT || 443,
-    
-    // Argo Tunnel
-    ARGO_DOMAIN: process.env.ARGO_DOMAIN || '',
-    ARGO_AUTH: process.env.ARGO_AUTH || '',
-    ARGO_PORT: process.env.ARGO_PORT || 8001,
-    
-    // sb settings
+    UUID: _defaultUuid,
+    FILE_PATH: process.env.FILE_PATH || path.join(os.tmpdir(), "xray-sing"),
+    SUB_PATH: process.env.SUB_PATH || "sub",
+    PORT: _publicPort,
+    NAME: process.env.NAME || "vless",
+
+    CFIP: process.env.CFIP || "www.kick.com",
+    CFPORT: parseInt(process.env.CFPORT || "443", 10),
+
+    // Argo enabled by default (set ENABLE_ARGO=0 to disable)
+    ENABLE_ARGO: !(process.env.ENABLE_ARGO === "0" || process.env.ENABLE_ARGO === "false"),
+    ARGO_DOMAIN: process.env.ARGO_DOMAIN || "",
+    ARGO_AUTH: process.env.ARGO_AUTH || "",
+    ARGO_PORT: parseInt(process.env.ARGO_PORT || "8001", 10),
+
     SB_VERSION: process.env.SB_VERSION || "1.11.15",
     SB_NAME: process.env.SB_NAME || "HY2",
-    SB_PORT: parseInt(process.env.SB_PORT || process.env.SERVER_PORT || process.env.PORT || "2705", 10),
-    SB_UUID: process.env.SB_UUID || process.env.UUID || '9afd1229-b893-40c1-84dd-51e7ce204913',
+    SB_PORT: _publicPort,
+    VLESS_LOCAL_PORT: parseInt(process.env.VLESS_LOCAL_PORT || "12080", 10),
+    SB_UUID: process.env.SB_UUID || _defaultUuid,
     SB_SNI: process.env.SB_SNI || "time.android.com",
     SB_MASS_PROXY: process.env.SB_MASS_PROXY || "https://www.gstatic.com",
-    SB_DOMAIN: process.env.SB_DOMAIN || process.env.DOMAIN,
+    SB_DOMAIN: process.env.SB_DOMAIN || process.env.DOMAIN || "",
     SB_HOST: process.env.SB_HOST || "127.0.0.1",
-    SB_OBFS_PWD: process.env.SB_OBFS_PWD || Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2)
+    // Set in Application.initialize() — env or persisted file (stable across restarts)
+    SB_OBFS_PWD: process.env.SB_OBFS_PWD || "",
+
+    WS_PATH: process.env.WS_PATH || process.env.SB_UUID || _defaultUuid,
+    VLESS_NAME: process.env.VLESS_NAME || "VLESS-WS",
+
+    WEB_URL: process.env.WEB_URL || "",
+    BOT_URL: process.env.BOT_URL || ""
 };
 
 // ========== CONSTANTS ==========
@@ -56,7 +75,7 @@ const ARCH = (() => {
 })();
 
 const TAR_NAME = `sing-box-${CONFIG.SB_VERSION}-linux-${ARCH}.tar.gz`;
-const DOWNLOAD_URL = process.env.SB_URL || 
+const DOWNLOAD_URL = process.env.SB_URL ||
     `https://github.com/SagerNet/sing-box/releases/download/v${CONFIG.SB_VERSION}/${TAR_NAME}`;
 
 // File paths
@@ -75,24 +94,29 @@ const PATHS = {
 // Global state
 const state = {
     xLinks: [],
-    sboxLinks: [],
+    sboxLinks: [],          // Hysteria2 links
+    vlessWsLinks: [],       // VLESS-WS links (same port as HY2)
     xBase64: "",
     sboxBase64: "",
+    vlessWsBase64: "",
     sbProcess: null
 };
 
 // ========== LOGGER ==========
+// QUIET=1 — only errors. Default: normal progress output.
 class Logger {
+    static quiet = process.env.QUIET === "1" || process.env.QUIET === "true";
+
     static info(message) {
-        console.log(`${COLORS.cyan}ℹ ${message}${COLORS.reset}`);
+        if (!this.quiet) console.log(`${COLORS.cyan}ℹ ${message}${COLORS.reset}`);
     }
 
     static success(message) {
-        console.log(`${COLORS.green}✅ ${message}${COLORS.reset}`);
+        if (!this.quiet) console.log(`${COLORS.green}✅ ${message}${COLORS.reset}`);
     }
 
     static warning(message) {
-        console.log(`${COLORS.yellow}⚠ ${message}${COLORS.reset}`);
+        if (!this.quiet) console.log(`${COLORS.yellow}⚠ ${message}${COLORS.reset}`);
     }
 
     static error(message) {
@@ -100,21 +124,35 @@ class Logger {
     }
 
     static step(message) {
-        console.log(`${COLORS.blue}➤ ${message}${COLORS.reset}`);
+        if (!this.quiet) console.log(`${COLORS.blue}➤ ${message}${COLORS.reset}`);
     }
 
     static header(message) {
-        console.log(`\n${COLORS.bright}${COLORS.magenta}${'='.repeat(60)}${COLORS.reset}`);
-        console.log(`${COLORS.bright}${COLORS.magenta}${message}${COLORS.reset}`);
-        console.log(`${COLORS.bright}${COLORS.magenta}${'='.repeat(60)}${COLORS.reset}\n`);
+        if (!this.quiet) {
+            console.log(`\n${COLORS.bright}${COLORS.magenta}${"=".repeat(56)}${COLORS.reset}`);
+            console.log(`${COLORS.bright}${COLORS.magenta}  ${message}${COLORS.reset}`);
+            console.log(`${COLORS.bright}${COLORS.magenta}${"=".repeat(56)}${COLORS.reset}\n`);
+        }
     }
 
     static divider() {
-        console.log(`${COLORS.dim}${'-'.repeat(60)}${COLORS.reset}`);
+        if (!this.quiet) console.log(`${COLORS.dim}${"─".repeat(56)}${COLORS.reset}`);
     }
 
     static config(key, value) {
-        console.log(`  ${COLORS.cyan}${key}:${COLORS.reset} ${COLORS.yellow}${value}${COLORS.reset}`);
+        if (!this.quiet) console.log(`  ${COLORS.cyan}${key}:${COLORS.reset} ${COLORS.yellow}${value}${COLORS.reset}`);
+    }
+
+    /** Clear terminal (ANSI + fallback for panel log viewers) */
+    static clearConsole() {
+        try {
+            if (typeof console.clear === "function") console.clear();
+        } catch { /* ignore */ }
+        try {
+            process.stdout.write("\x1B[2J\x1B[3J\x1B[H\x1Bc");
+        } catch { /* ignore */ }
+        // Panels that ignore ANSI still get a visual break
+        console.log("\n".repeat(8));
     }
 }
 
@@ -131,7 +169,7 @@ class SystemUtils {
             "https://api.ipify.org",
             "https://ifconfig.io/ip",
         ];
-        
+
         for (const url of curlCandidates) {
             try {
                 const result = spawnSync("curl", ["-sS", url], {
@@ -146,7 +184,7 @@ class SystemUtils {
                 // Continue to next candidate
             }
         }
-        
+
         try {
             const result = spawnSync("dig", ["+short", "myip.opendns.com", "@resolver1.opendns.com"], {
                 encoding: "utf8",
@@ -159,31 +197,71 @@ class SystemUtils {
         } catch {
             // Fall through
         }
-        
+
         return null;
     }
 
     /**
-     * Get ISP information
+     * Get ISP / location label for node name (e.g. OVH-France or AS16276-OVH)
      */
     static async getISPInfo() {
+        const sanitize = (s) => String(s || '')
+            .replace(/[^\w.\-]+/g, '_')
+            .replace(/_+/g, '_')
+            .replace(/^_|_$/g, '')
+            .slice(0, 48) || 'UNKNOWN';
+
+        // 1) Cloudflare speed meta (JSON)
         try {
-            const metaInfo = spawnSync(
-                'curl -s https://speed.cloudflare.com/meta | awk -F\\" \'{print $26"-"$18}\' | sed -e \'s/ /_/g\'',
-                { 
-                    encoding: 'utf-8',
-                    shell: true 
-                }
-            );
-            
-            if (metaInfo.status === 0 && metaInfo.stdout) {
-                const isp = metaInfo.stdout.trim();
-                return isp && isp.length > 0 ? isp : "UNKNOWN";
+            const r = spawnSync('curl', ['-sS', '--max-time', '6', 'https://speed.cloudflare.com/meta'], {
+                encoding: 'utf8',
+                timeout: 8000
+            });
+            if (r.status === 0 && r.stdout) {
+                const j = JSON.parse(r.stdout);
+                // Typical fields: colo, city, clientIp, asOrganization / asn
+                const org = j.asOrganization || j.asn || j.clientAsn || '';
+                const city = j.city || j.colo || '';
+                const label = [org, city].filter(Boolean).join('-');
+                if (label) return sanitize(label);
             }
-        } catch (error) {
-            Logger.error(`Failed to get ISP info: ${error.message}`);
+        } catch {
+            // continue
         }
-        return "UNKNOWN";
+
+        // 2) ipinfo.io
+        try {
+            const r = spawnSync('curl', ['-sS', '--max-time', '6', 'https://ipinfo.io/json'], {
+                encoding: 'utf8',
+                timeout: 8000
+            });
+            if (r.status === 0 && r.stdout) {
+                const j = JSON.parse(r.stdout);
+                const label = [j.org, j.city || j.country].filter(Boolean).join('-');
+                if (label) return sanitize(label);
+            }
+        } catch {
+            // continue
+        }
+
+        // 3) ip-api.com
+        try {
+            const r = spawnSync('curl', ['-sS', '--max-time', '6', 'http://ip-api.com/json/?fields=status,isp,org,as,city,country'], {
+                encoding: 'utf8',
+                timeout: 8000
+            });
+            if (r.status === 0 && r.stdout) {
+                const j = JSON.parse(r.stdout);
+                if (j.status === 'success') {
+                    const label = [j.isp || j.org || j.as, j.city || j.country].filter(Boolean).join('-');
+                    if (label) return sanitize(label);
+                }
+            }
+        } catch {
+            // continue
+        }
+
+        return 'UNKNOWN';
     }
 
     /**
@@ -202,6 +280,19 @@ class SystemUtils {
     static downloadFile(fileName, fileUrl) {
         return new Promise((resolve, reject) => {
             const filePath = path.join(CONFIG.FILE_PATH, fileName);
+
+            // Skip download only if a reasonably sized binary already exists
+            try {
+                const minSize = (fileName === "web" || fileName === "bot") ? 500 * 1024 : 1024;
+                if (fs.existsSync(filePath) && fs.statSync(filePath).size >= minSize) {
+                    fs.chmodSync(filePath, 0o755);
+                    Logger.info(`Already present, skip download: ${fileName}`);
+                    return resolve(fileName);
+                }
+            } catch {
+                // continue to download
+            }
+
             const writer = fs.createWriteStream(filePath);
 
             axios({
@@ -236,7 +327,7 @@ class SystemUtils {
      */
     static applySystemOptimizations() {
         Logger.step("Applying system optimizations for maximum performance...");
-        
+
         try {
             const optimizations = [
                 // TCP optimizations
@@ -247,20 +338,20 @@ class SystemUtils {
                 'sysctl -w net.core.netdev_max_backlog=100000',
                 'sysctl -w net.core.somaxconn=65535',
                 'sysctl -w net.ipv4.tcp_max_syn_backlog=65535',
-                
+
                 // BBR congestion control
                 'sysctl -w net.ipv4.tcp_congestion_control=bbr',
                 'sysctl -w net.ipv4.tcp_fastopen=3',
                 'sysctl -w net.core.default_qdisc=fq_codel',
-                
+
                 // File descriptor limits
                 'sysctl -w fs.file-max=2097152',
                 'sysctl -w fs.nr_open=2097152',
-                
+
                 // Memory optimizations
                 'sysctl -w net.ipv4.tcp_mem="786432 2097152 3145728"',
                 'sysctl -w net.ipv4.udp_mem="786432 2097152 3145728"',
-                
+
                 // Additional optimizations
                 'sysctl -w net.ipv4.tcp_slow_start_after_idle=0',
                 'sysctl -w net.ipv4.tcp_tw_reuse=1',
@@ -279,7 +370,7 @@ class SystemUtils {
                     // Ignore errors if no root privileges
                 }
             }
-            
+
             if (applied > 0) {
                 Logger.success(`Applied ${applied} system optimizations`);
             } else {
@@ -291,7 +382,7 @@ class SystemUtils {
     }
 }
 
-// ========== SB MANAGER ==========
+// ========== SB MANAGER (Hysteria2 + VLESS-WS) ==========
 class SbManager {
     /**
      * Get server host (domain, IP, or fallback)
@@ -307,24 +398,24 @@ class SbManager {
             Logger.info(`Using public IP: ${publicIp}`);
             return publicIp;
         }
-        
+
         Logger.warning(`Using fallback host: ${CONFIG.SB_HOST}`);
         return CONFIG.SB_HOST;
     }
 
     /**
-     * Ensure TLS certificates exist
+     * Ensure TLS certificates exist (used by Hysteria2)
      */
     static ensureCertificates() {
         SystemUtils.ensureDirectory(PATHS.SB_CERT_DIR);
-        
+
         // Use external certificates if provided
         if (process.env.EXTERNAL_CERT && process.env.EXTERNAL_KEY &&
             fs.existsSync(process.env.EXTERNAL_CERT) && fs.existsSync(process.env.EXTERNAL_KEY)) {
             Logger.info("Using external TLS certificates");
-            return { 
-                cert: process.env.EXTERNAL_CERT, 
-                key: process.env.EXTERNAL_KEY 
+            return {
+                cert: process.env.EXTERNAL_CERT,
+                key: process.env.EXTERNAL_KEY
             };
         }
 
@@ -338,14 +429,14 @@ class SbManager {
                 "-out", PATHS.SB_CERT_PATH,
                 "-days", "365",
             ]);
-            
+
             if (result.status !== 0) {
                 Logger.error("Failed to generate TLS certificate");
                 return { cert: null, key: null };
             }
             Logger.success("TLS certificate generated");
         }
-        
+
         return { cert: PATHS.SB_CERT_PATH, key: PATHS.SB_KEY_PATH };
     }
 
@@ -356,17 +447,17 @@ class SbManager {
         if (fs.existsSync(PATHS.SB_BIN)) {
             return true;
         }
-        
+
         SystemUtils.ensureDirectory(PATHS.SB_BASE_DIR);
         Logger.step(`Downloading sb (${ARCH})`);
-        
+
         const tarPath = path.join(PATHS.SB_BASE_DIR, TAR_NAME);
-        
+
         // Download sb
         const curlResult = spawnSync("curl", ["-L", "-sS", "-o", tarPath, DOWNLOAD_URL], {
             timeout: 60000
         });
-        
+
         if (curlResult.status !== 0) {
             Logger.error("Failed to download sb");
             return false;
@@ -384,26 +475,39 @@ class SbManager {
         if (fs.existsSync(path.join(extractedDir, "sing-box"))) {
             fs.renameSync(path.join(extractedDir, "sing-box"), PATHS.SB_BIN);
             spawnSync("chmod", ["+x", PATHS.SB_BIN]);
+            // Free disk: remove archive and extracted folder
+            try {
+                fs.unlinkSync(tarPath);
+                fs.rmSync(extractedDir, { recursive: true, force: true });
+            } catch {
+                // ignore cleanup errors
+            }
             Logger.success("sb installed successfully");
             return true;
         }
-        
+
         Logger.error("sb binary not found in archive");
         return false;
     }
 
     /**
-     * Create sb configuration
+     * Create sing-box configuration
+     * Hysteria2 (UDP) and VLESS-WS (TCP) share the same listen_port.
+     * This is safe because the protocols use different transport layers.
      */
     static writeConfiguration(cert, key) {
-        Logger.step("Creating sb configuration");
-        
+        Logger.step("Creating sb configuration (Hysteria2 + VLESS-WS)");
+
+        // Normalize WS path: must start with / for the transport
+        const wsPath = CONFIG.WS_PATH.startsWith('/') ? CONFIG.WS_PATH : `/${CONFIG.WS_PATH}`;
+
         const config = {
             "log": {
                 "level": "info",
                 "timestamp": true
             },
             "inbounds": [
+                // ---------- Hysteria2 (UDP / QUIC) on public port ----------
                 {
                     "type": "hysteria2",
                     "tag": "hy2-in",
@@ -433,6 +537,30 @@ class SbManager {
                     "ignore_client_bandwidth": false,
                     "up_mbps": 100,
                     "down_mbps": 100
+                },
+                // ---------- VLESS + WebSocket (TCP) on localhost only ----------
+                // Public clients connect to Express on the public port; Express
+                // proxies WebSocket upgrades to this inbound.
+                {
+                    "type": "vless",
+                    "tag": "vless-ws-in",
+                    "listen": "127.0.0.1",
+                    "listen_port": CONFIG.VLESS_LOCAL_PORT,
+                    "users": [
+                        {
+                            "uuid": CONFIG.SB_UUID,
+                            "flow": ""
+                        }
+                    ],
+                    "tls": {
+                        "enabled": false
+                    },
+                    "transport": {
+                        "type": "ws",
+                        "path": wsPath,
+                        "max_early_data": 2560,
+                        "early_data_header_name": "Sec-WebSocket-Protocol"
+                    }
                 }
             ],
             "outbounds": [
@@ -448,7 +576,7 @@ class SbManager {
         };
 
         fs.writeFileSync(PATHS.SB_JSON, JSON.stringify(config, null, 2));
-        Logger.success("sb configuration created");
+        Logger.success(`sb config: HY2 UDP :${CONFIG.SB_PORT} + VLESS-WS 127.0.0.1:${CONFIG.VLESS_LOCAL_PORT}`);
     }
 
     /**
@@ -456,7 +584,7 @@ class SbManager {
      */
     static start() {
         Logger.step("Starting sb...");
-        
+
         if (!fs.existsSync(PATHS.SB_BIN)) {
             Logger.error("sb binary not found");
             return null;
@@ -513,12 +641,14 @@ class SbManager {
      */
     static async initialize() {
         Logger.header("SB CONFIGURATION");
-        
+
         // Display configuration
         Logger.config("Node Name", CONFIG.SB_NAME);
-        Logger.config("Port", CONFIG.SB_PORT);
+        Logger.config("Public port", CONFIG.SB_PORT);
+        Logger.config("VLESS local", CONFIG.VLESS_LOCAL_PORT);
         Logger.config("UUID", CONFIG.SB_UUID);
-        Logger.config("SNI", CONFIG.SB_SNI);
+        Logger.config("SNI (HY2)", CONFIG.SB_SNI);
+        Logger.config("WS Path", CONFIG.WS_PATH.startsWith('/') ? CONFIG.WS_PATH : `/${CONFIG.WS_PATH}`);
         Logger.config("Domain", CONFIG.SB_DOMAIN || 'Not set');
         Logger.config("Fallback Host", CONFIG.SB_HOST);
         Logger.config("Version", CONFIG.SB_VERSION);
@@ -543,19 +673,27 @@ class SbManager {
     }
 
     /**
-     * Generate shareable links
+     * Generate shareable links for both Hysteria2 and VLESS-WS
      */
     static async generateLinks() {
         const isp = await SystemUtils.getISPInfo();
         const serverHost = await this.getServerHost();
         const insecure = process.env.EXTERNAL_CERT ? "0" : "1";
 
-        const baseUrl = `hysteria2://${CONFIG.SB_UUID}@${serverHost}:${CONFIG.SB_PORT}/?sni=${CONFIG.SB_SNI}&obfs=salamander&obfs-password=${CONFIG.SB_OBFS_PWD}&insecure=${insecure}#${CONFIG.SB_NAME}-${isp}`;
+        // Hysteria2 link
+        const hy2Url = `hysteria2://${CONFIG.SB_UUID}@${serverHost}:${CONFIG.SB_PORT}/?sni=${CONFIG.SB_SNI}&obfs=salamander&obfs-password=${CONFIG.SB_OBFS_PWD}&insecure=${insecure}#${CONFIG.SB_NAME}-${isp}`;
 
-        state.sboxLinks = [baseUrl];
-        state.sboxBase64 = Buffer.from(baseUrl).toString('base64');
-        
-        return baseUrl;
+        // VLESS-WS link (matches the requested format)
+        // path without leading slash in the query to match common client expectations
+        const wsPathForLink = CONFIG.WS_PATH.startsWith('/') ? CONFIG.WS_PATH.slice(1) : CONFIG.WS_PATH;
+        const vlessWsUrl = `vless://${CONFIG.SB_UUID}@${serverHost}:${CONFIG.SB_PORT}?encryption=none&security=none&type=ws&path=${encodeURIComponent(wsPathForLink)}#${CONFIG.VLESS_NAME}-${isp}`;
+
+        state.sboxLinks = [hy2Url];
+        state.vlessWsLinks = [vlessWsUrl];
+        state.sboxBase64 = Buffer.from(hy2Url).toString('base64');
+        state.vlessWsBase64 = Buffer.from(vlessWsUrl).toString('base64');
+
+        return { hy2: hy2Url, vlessWs: vlessWsUrl };
     }
 }
 
@@ -566,70 +704,70 @@ class XManager {
      */
     static createConfiguration() {
         Logger.step("Creating X configuration");
-        
+
         const config = {
-            log: { 
-                access: '/dev/null', 
-                error: '/dev/null', 
-                loglevel: 'none' 
+            log: {
+                access: '/dev/null',
+                error: '/dev/null',
+                loglevel: 'none'
             },
             inbounds: [
-                { 
-                    port: CONFIG.ARGO_PORT, 
-                    protocol: 'vless', 
-                    settings: { 
-                        clients: [{ 
-                            id: CONFIG.UUID, 
-                            flow: 'xtls-rprx-vision' 
-                        }], 
-                        decryption: 'none', 
+                {
+                    port: CONFIG.ARGO_PORT,
+                    protocol: 'vless',
+                    settings: {
+                        clients: [{
+                            id: CONFIG.UUID,
+                            flow: 'xtls-rprx-vision'
+                        }],
+                        decryption: 'none',
                         fallbacks: [
-                            { dest: 3001 }, 
+                            { dest: 3001 },
                             { path: "/vless-argo", dest: 3002 }
-                        ] 
-                    }, 
-                    streamSettings: { network: 'tcp' } 
+                        ]
+                    },
+                    streamSettings: { network: 'tcp' }
                 },
-                { 
-                    port: 3001, 
-                    listen: "127.0.0.1", 
-                    protocol: "vless", 
-                    settings: { 
-                        clients: [{ id: CONFIG.UUID }], 
-                        decryption: "none" 
-                    }, 
-                    streamSettings: { 
-                        network: "ws", 
+                {
+                    port: 3001,
+                    listen: "127.0.0.1",
+                    protocol: "vless",
+                    settings: {
+                        clients: [{ id: CONFIG.UUID }],
+                        decryption: "none"
+                    },
+                    streamSettings: {
+                        network: "ws",
                         security: "none",
                         wsSettings: { path: "/vless-argo" }
                     }
                 },
-                { 
-                    port: 3002, 
-                    listen: "127.0.0.1", 
-                    protocol: "vless", 
-                    settings: { 
-                        clients: [{ id: CONFIG.UUID, level: 0 }], 
-                        decryption: "none" 
-                    }, 
-                    streamSettings: { 
-                        network: "ws", 
-                        security: "none", 
-                        wsSettings: { path: "/vless-argo" } 
-                    }, 
-                    sniffing: { 
-                        enabled: true, 
-                        destOverride: ["http", "tls", "quic"], 
-                        metadataOnly: false 
-                    } 
+                {
+                    port: 3002,
+                    listen: "127.0.0.1",
+                    protocol: "vless",
+                    settings: {
+                        clients: [{ id: CONFIG.UUID, level: 0 }],
+                        decryption: "none"
+                    },
+                    streamSettings: {
+                        network: "ws",
+                        security: "none",
+                        wsSettings: { path: "/vless-argo" }
+                    },
+                    sniffing: {
+                        enabled: true,
+                        destOverride: ["http", "tls", "quic"],
+                        metadataOnly: false
+                    }
                 }
             ],
-            dns: { 
-                servers: ["https+local://8.8.8.8/dns-query"] 
+            dns: {
+                servers: ["https+local://8.8.8.8/dns-query"]
             },
-            outbounds: [ 
-                { protocol: "freedom", tag: "direct" }, 
-                { protocol: "blackhole", tag: "block" } 
+            outbounds: [
+                { protocol: "freedom", tag: "direct" },
+                { protocol: "blackhole", tag: "block" }
             ]
         };
 
@@ -649,13 +787,32 @@ class XManager {
      * Get files to download for current architecture
      */
     static getFilesForArchitecture(architecture) {
-        return architecture === 'arm' ? [
-            { fileName: "web", fileUrl: "https://arm64.ssss.nyc.mn/web" },
-            { fileName: "bot", fileUrl: "https://arm64.ssss.nyc.mn/2go" }
-        ] : [
-            { fileName: "web", fileUrl: "https://amd64.ssss.nyc.mn/web" },
-            { fileName: "bot", fileUrl: "https://amd64.ssss.nyc.mn/2go" }
+        const isArm = architecture === "arm";
+        // Same mirrors as the original working setup (override with WEB_URL / BOT_URL)
+        const webDefault = isArm
+            ? "https://arm64.ssss.nyc.mn/web"
+            : "https://amd64.ssss.nyc.mn/web";
+        const botDefault = isArm
+            ? "https://arm64.ssss.nyc.mn/2go"
+            : "https://amd64.ssss.nyc.mn/2go";
+
+        return [
+            { fileName: "web", fileUrl: CONFIG.WEB_URL || webDefault },
+            { fileName: "bot", fileUrl: CONFIG.BOT_URL || botDefault }
         ];
+    }
+
+    /**
+     * Remove stale / incomplete binaries so they re-download
+     */
+    static purgeBadBinary(fileName, minBytes = 1024 * 500) {
+        const p = path.join(CONFIG.FILE_PATH, fileName);
+        try {
+            if (fs.existsSync(p) && fs.statSync(p).size < minBytes) {
+                fs.unlinkSync(p);
+                Logger.warning(`Removed incomplete binary: ${fileName}`);
+            }
+        } catch { /* ignore */ }
     }
 
     /**
@@ -670,42 +827,61 @@ class XManager {
             return;
         }
 
+        // Drop truncated downloads from previous ENOSPC runs
+        this.purgeBadBinary("web");
+        this.purgeBadBinary("bot");
+
         Logger.step(`Downloading files for ${architecture} architecture`);
-        
+
         try {
-            const downloadPromises = filesToDownload.map(file => 
+            const downloadPromises = filesToDownload.map(file =>
                 SystemUtils.downloadFile(file.fileName, file.fileUrl)
             );
             await Promise.all(downloadPromises);
             Logger.success("All files downloaded successfully");
         } catch (error) {
-            Logger.error(`Download failed: ${error}`);
-            return;
+            Logger.warning(`X components download failed: ${error}`);
+            Logger.warning("Continuing without Argo/X — Hysteria2 and VLESS-WS remain available");
         }
 
-        // Set file permissions
-        const filesToAuthorize = ['./web', './bot'];
-        filesToAuthorize.forEach(relativeFilePath => {
-            const absoluteFilePath = path.join(CONFIG.FILE_PATH, relativeFilePath);
+        ["web", "bot"].forEach((name) => {
+            const absoluteFilePath = path.join(CONFIG.FILE_PATH, name);
             if (fs.existsSync(absoluteFilePath)) {
-                fs.chmodSync(absoluteFilePath, 0o755);
-                Logger.success(`Permissions set for: ${absoluteFilePath}`);
+                try { fs.chmodSync(absoluteFilePath, 0o755); } catch { /* ignore */ }
             }
         });
 
-        // Start services
-        await this.startXCore();
-        await this.startCloudflared();
+        // Stop previous instances so ports/logs are clean
+        try {
+            execSync(`pkill -f "${CONFIG.FILE_PATH}/web" 2>/dev/null || true`, { shell: true });
+            execSync(`pkill -f "${CONFIG.FILE_PATH}/bot" 2>/dev/null || true`, { shell: true });
+        } catch { /* ignore */ }
+
+        if (fs.existsSync(path.join(CONFIG.FILE_PATH, "web"))) {
+            await this.startXCore();
+            // Let Xray bind ARGO_PORT before cloudflared connects
+            await new Promise((r) => setTimeout(r, 2500));
+        } else {
+            Logger.warning("X core binary missing — skipping X server");
+            return;
+        }
+
+        if (fs.existsSync(path.join(CONFIG.FILE_PATH, "bot"))) {
+            await this.startCloudflared();
+        } else {
+            Logger.warning("Cloudflared binary missing — skipping Argo tunnel");
+        }
     }
 
     /**
      * Start X core
      */
     static async startXCore() {
-        const command = `nohup ${CONFIG.FILE_PATH}/web -c ${PATHS.X_CONFIG} >/dev/null 2>&1 &`;
+        const webPath = path.join(CONFIG.FILE_PATH, "web");
+        const command = `nohup "${webPath}" -c "${PATHS.X_CONFIG}" >/dev/null 2>&1 &`;
         try {
             exec(command);
-            Logger.success('X core started');
+            Logger.success("X core started");
         } catch (error) {
             Logger.error(`Failed to start X core: ${error}`);
         }
@@ -715,26 +891,72 @@ class XManager {
      * Start Cloudflared tunnel
      */
     static async startCloudflared() {
-        if (!fs.existsSync(path.join(CONFIG.FILE_PATH, 'bot'))) {
+        const botPath = path.join(CONFIG.FILE_PATH, "bot");
+        if (!fs.existsSync(botPath)) {
             return;
         }
 
-        let args;
+        try { fs.writeFileSync(PATHS.BOOT_LOG, ""); } catch { /* ignore */ }
 
-        if (CONFIG.ARGO_AUTH.match(/^[A-Z0-9a-z=]{120,250}$/)) {
-            args = `tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${CONFIG.ARGO_AUTH}`;
-        } else if (CONFIG.ARGO_AUTH.match(/TunnelSecret/)) {
-            args = `tunnel --edge-ip-version auto --config ${CONFIG.FILE_PATH}/tunnel.yml run`;
+        let args;
+        const auth = CONFIG.ARGO_AUTH || "";
+
+        if (/^[A-Z0-9a-z=]{120,250}$/.test(auth)) {
+            args = `tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${auth}`;
+        } else if (/TunnelSecret/.test(auth)) {
+            args = `tunnel --edge-ip-version auto --config "${CONFIG.FILE_PATH}/tunnel.yml" run`;
         } else {
-            args = `tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile ${PATHS.BOOT_LOG} --loglevel info --url http://localhost:${CONFIG.ARGO_PORT}`;
+            // Quick tunnel — domain appears in log as *.trycloudflare.com
+            // Match original working flags + explicit logfile
+            args = `tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile "${PATHS.BOOT_LOG}" --loglevel info --url http://127.0.0.1:${CONFIG.ARGO_PORT}`;
         }
 
         try {
-            exec(`nohup ${CONFIG.FILE_PATH}/bot ${args} >/dev/null 2>&1 &`);
-            Logger.success('Cloudflared tunnel started');
+            // Also append process streams in case --logfile is ignored by some builds
+            const cmd = `nohup "${botPath}" ${args} >> "${PATHS.BOOT_LOG}" 2>&1 &`;
+            exec(cmd);
+            Logger.success("Cloudflared tunnel started");
         } catch (error) {
             Logger.error(`Failed to start Cloudflared: ${error}`);
         }
+    }
+
+    /**
+     * Read trycloudflare.com hostname from cloudflared log
+     */
+    static parseArgoDomainFromLog(content) {
+        if (!content) return null;
+        // Matches: https://foo-bar.trycloudflare.com  or  foo-bar.trycloudflare.com
+        const re = /(?:https?:\/\/)?([a-z0-9-]+\.trycloudflare\.com)/gi;
+        let match;
+        let last = null;
+        while ((match = re.exec(content)) !== null) {
+            const host = match[1].toLowerCase();
+            if (host !== "fallback.trycloudflare.com" && host !== "trycloudflare.com") {
+                last = host;
+            }
+        }
+        return last;
+    }
+
+    /**
+     * Poll boot.log until a trycloudflare domain appears (or timeout)
+     */
+    static async waitForArgoDomain(timeoutMs = 45000, intervalMs = 2000) {
+        const started = Date.now();
+        while (Date.now() - started < timeoutMs) {
+            try {
+                if (fs.existsSync(PATHS.BOOT_LOG)) {
+                    const content = fs.readFileSync(PATHS.BOOT_LOG, "utf8");
+                    const domain = this.parseArgoDomainFromLog(content);
+                    if (domain) return domain;
+                }
+            } catch {
+                // keep polling
+            }
+            await new Promise((r) => setTimeout(r, intervalMs));
+        }
+        return null;
     }
 
     /**
@@ -743,37 +965,29 @@ class XManager {
     static async extractDomains() {
         let argoDomain;
 
+        // Named tunnel: user must set ARGO_DOMAIN
         if (CONFIG.ARGO_AUTH && CONFIG.ARGO_DOMAIN) {
             argoDomain = CONFIG.ARGO_DOMAIN;
-            Logger.config('ARGO_DOMAIN', argoDomain);
+            Logger.config("ARGO_DOMAIN", argoDomain);
             await this.generateLinks(argoDomain);
-        } else {
-            try {
-                Logger.step("Waiting for Cloudflared to start...");
-                await new Promise(resolve => setTimeout(resolve, 8000));
-                
-                if (fs.existsSync(PATHS.BOOT_LOG)) {
-                    const fileContent = fs.readFileSync(PATHS.BOOT_LOG, 'utf-8');
-                    const domains = fileContent.split('\n')
-                        .map(line => line.match(/https?:\/\/([^ ]*trycloudflare\.com)\/?/))
-                        .filter(match => match)
-                        .map(match => match[1]);
-
-                    argoDomain = domains.length > 0 ? domains[0] : "fallback.trycloudflare.com";
-                    Logger.config('Argo Domain', argoDomain);
-                } else {
-                    Logger.warning('Boot log not found, using fallback domain');
-                    argoDomain = "fallback.trycloudflare.com";
-                }
-                
-                await this.generateLinks(argoDomain);
-            } catch (error) {
-                Logger.error('Error reading boot log:', error);
-                argoDomain = "fallback.trycloudflare.com";
-                await this.generateLinks(argoDomain);
-            }
+            return argoDomain;
         }
 
+        if (CONFIG.ARGO_AUTH && !CONFIG.ARGO_DOMAIN) {
+            Logger.warning("ARGO_AUTH set without ARGO_DOMAIN — cannot build Argo link host");
+        }
+
+        Logger.step("Waiting for Cloudflare quick tunnel domain...");
+        argoDomain = await this.waitForArgoDomain(45000, 2000);
+
+        if (!argoDomain) {
+            Logger.warning("Argo domain not found in log — using fallback");
+            argoDomain = "fallback.trycloudflare.com";
+        } else {
+            Logger.config("Argo Domain", argoDomain);
+        }
+
+        await this.generateLinks(argoDomain);
         return argoDomain;
     }
 
@@ -786,10 +1000,10 @@ class XManager {
         return new Promise((resolve) => {
             setTimeout(() => {
                 const vlessLink = `vless://${CONFIG.UUID}@${CONFIG.CFIP}:${CONFIG.CFPORT}?encryption=none&security=tls&sni=${argoDomain}&type=ws&host=${argoDomain}&path=%2Fvless-argo%3Fed%3D2560#${CONFIG.NAME}-${isp}`;
-                
+
                 state.xLinks = [vlessLink];
                 state.xBase64 = Buffer.from(vlessLink).toString('base64');
-                
+
                 resolve(vlessLink);
             }, 2000);
         });
@@ -799,36 +1013,105 @@ class XManager {
 // ========== HTTP SERVER ==========
 class HttpServer {
     /**
-     * Create Express application
+     * Create Express application (plain HTTP panel)
      */
     static createApp() {
         const app = express();
 
-        // Health check endpoint
-        app.get("/", (req, res) => {
-            res.json({ 
-                service: "Hello World",
-            });
-        });
+        const servePage = (req, res) => this.sendSubscriptionPage(res);
+        app.get("/", servePage);
+        app.get(`/${CONFIG.SUB_PATH}`, servePage);
+        app.get("/sub", servePage);
 
-        // Subscription endpoint
-        app.get(`/${CONFIG.SUB_PATH}`, (req, res) => {
-            this.sendSubscriptionPage(res);
+        app.get("/health", (req, res) => {
+            res.json({
+                ok: true,
+                hy2: !!state.sbProcess,
+                port: CONFIG.SB_PORT,
+                vlessLocal: CONFIG.VLESS_LOCAL_PORT
+            });
         });
 
         return app;
     }
 
     /**
+     * Start public HTTP server + WebSocket proxy to local VLESS
+     * Public TCP port is owned by this server (plain http://IP:PORT/sub works).
+     * WS upgrades on the VLESS path are piped to sing-box on 127.0.0.1.
+     */
+    static startServer() {
+        const app = this.createApp();
+        const server = http.createServer(app);
+
+        const wsPathNorm = (CONFIG.WS_PATH.startsWith('/') ? CONFIG.WS_PATH : `/${CONFIG.WS_PATH}`).replace(/\/+$/, '') || '/';
+
+        server.on("upgrade", (req, socket, head) => {
+            try {
+                const urlPath = (req.url || "/").split("?")[0].replace(/\/+$/, '') || '/';
+                const pathOk =
+                    urlPath === wsPathNorm ||
+                    urlPath === wsPathNorm + '/' ||
+                    decodeURIComponent(urlPath) === wsPathNorm;
+
+                if (!pathOk) {
+                    socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+                    socket.destroy();
+                    return;
+                }
+
+                // Pipe client socket ↔ local VLESS-WS (sing-box)
+                const target = net.connect(CONFIG.VLESS_LOCAL_PORT, "127.0.0.1", () => {
+                    // Rebuild the HTTP upgrade request for the backend
+                    let reqLines = `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n`;
+                    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+                        reqLines += `${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}\r\n`;
+                    }
+                    reqLines += "\r\n";
+                    target.write(reqLines);
+                    if (head && head.length) target.write(head);
+
+                    socket.pipe(target);
+                    target.pipe(socket);
+                });
+
+                target.on("error", () => {
+                    try { socket.destroy(); } catch { /* ignore */ }
+                });
+                socket.on("error", () => {
+                    try { target.destroy(); } catch { /* ignore */ }
+                });
+            } catch {
+                try { socket.destroy(); } catch { /* ignore */ }
+            }
+        });
+
+        return new Promise((resolve, reject) => {
+            server.listen(CONFIG.PORT, "0.0.0.0", () => {
+                Logger.success(`HTTP panel + WS proxy on 0.0.0.0:${CONFIG.PORT}`);
+                Logger.info(`Open: http://YOUR_IP:${CONFIG.PORT}/${CONFIG.SUB_PATH}`);
+                resolve(server);
+            });
+            server.on("error", (err) => {
+                Logger.error(`HTTP server error: ${err.message}`);
+                reject(err);
+            });
+        });
+    }
+
+    /**
      * Send subscription page
      */
     static sendSubscriptionPage(res) {
-        const safeXLinks = state.xLinks.map(link => this.escapeHtml(link));
-        const safeSboxLinks = state.sboxLinks.map(link => this.escapeHtml(link));
-        const safeXBase64 = this.escapeHtml(state.xBase64 || '');
-        const safeSboxBase64 = this.escapeHtml(state.sboxBase64 || '');
-
-        res.send(this.generateHtml(safeXLinks, safeSboxLinks, safeXBase64, safeSboxBase64));
+        // Pass raw links; escaping is done inside the HTML builders
+        res.send(this.generateHtml(
+            state.xLinks.slice(),
+            state.sboxLinks.slice(),
+            state.vlessWsLinks.slice(),
+            state.xBase64 || '',
+            state.sboxBase64 || '',
+            state.vlessWsBase64 || ''
+        ));
     }
 
     /**
@@ -848,444 +1131,410 @@ class HttpServer {
     /**
      * Generate HTML page
      */
-    static generateHtml(xLinks, sboxLinks, xBase64, sboxBase64) {
-        return `
-<!DOCTYPE html>
+    static generateHtml(xLinks, sboxLinks, vlessWsLinks, xBase64, sboxBase64, vlessWsBase64) {
+        const cards = [];
+        if (sboxLinks.length > 0) cards.push(this.generateProtocolCard({
+            id: 'hy2',
+            title: 'Hysteria2',
+            subtitle: 'High-speed UDP · Brutal congestion control',
+            icon: 'fa-rocket',
+            accent: 'hy2',
+            badges: ['UDP', 'QUIC', 'Port ' + CONFIG.SB_PORT],
+            links: sboxLinks,
+            base64: sboxBase64
+        }));
+        if (vlessWsLinks.length > 0) cards.push(this.generateProtocolCard({
+            id: 'vless',
+            title: 'VLESS-WS',
+            subtitle: 'WebSocket over TCP · same public port',
+            icon: 'fa-network-wired',
+            accent: 'vless',
+            badges: ['TCP', 'WebSocket', 'No TLS'],
+            links: vlessWsLinks,
+            base64: vlessWsBase64
+        }));
+        if (xLinks.length > 0) cards.push(this.generateProtocolCard({
+            id: 'argo',
+            title: 'VLESS Argo',
+            subtitle: 'Cloudflare Tunnel · CDN edge',
+            icon: 'fa-cloud',
+            accent: 'argo',
+            badges: ['TLS', 'CDN', 'Argo'],
+            links: xLinks,
+            base64: xBase64
+        }));
+
+        const activeCount = cards.length;
+
+        return `<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Xray-Sing</title>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
-    <style>
-        ${this.getStyles()}
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#0b0f19">
+<title>Xray-Sing · Nodes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet">
+<style>${this.getStyles()}</style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1><i class="fas fa-shield-alt"></i> Xray-Sing</h1>
-            <p>Secure and fast configurations</p>
-            <div class="status-indicator">
-                <i class="fas fa-circle"></i> Online
-            </div>
+<div class="bg-glow"></div>
+<div class="wrap">
+  <header class="hero">
+    <div class="hero-top">
+      <div class="logo">
+        <span class="logo-mark"><i class="fas fa-shield-halved"></i></span>
+        <div>
+          <h1>Xray-Sing</h1>
+          <p class="tagline">Multi-protocol edge node</p>
         </div>
-
-        <div class="grid">
-            ${this.generateXCard(xLinks, xBase64)}
-            ${this.generateSboxCard(sboxLinks, sboxBase64)}
-        </div>
+      </div>
+      <div class="status-pill online">
+        <span class="dot"></span> Online · ${activeCount} protocol${activeCount === 1 ? '' : 's'}
+      </div>
     </div>
+    <p class="hero-desc">Copy a link into your client (v2rayN, Streisand, Hiddify, NekoBox…). Hysteria2 and VLESS-WS share public port <strong>${CONFIG.SB_PORT}</strong>.</p>
+  </header>
 
-    <div class="toast" id="toast">Copied to clipboard!</div>
+  <main class="grid">
+    ${cards.length ? cards.join('') : '<div class="empty">No links generated yet. Wait a moment and refresh.</div>'}
+  </main>
 
-    <script>
-        ${this.getScript()}
-    </script>
+  <footer class="footer">
+    <span>Port <code>${CONFIG.SB_PORT}</code></span>
+    <span class="sep">·</span>
+    <span>HY2 UDP + VLESS TCP</span>
+    <span class="sep">·</span>
+    <span>Xray-Sing</span>
+  </footer>
+</div>
+
+<div class="toast" id="toast"><i class="fas fa-check"></i> <span id="toast-text">Copied</span></div>
+<script>${this.getScript()}</script>
 </body>
 </html>`;
     }
 
-    /**
-     * Get CSS styles
-     */
     static getStyles() {
         return `
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+:root {
+  --bg: #0b0f19;
+  --surface: #121826;
+  --surface2: #1a2234;
+  --border: rgba(255,255,255,0.08);
+  --border-hover: rgba(99,102,241,0.45);
+  --text: #e8edf7;
+  --muted: #8b95a8;
+  --primary: #6366f1;
+  --primary2: #818cf8;
+  --hy2: #22d3ee;
+  --vless: #a78bfa;
+  --argo: #34d399;
+  --ok: #10b981;
+  --radius: 16px;
+  --shadow: 0 20px 50px rgba(0,0,0,0.35);
+  --font: 'Inter', system-ui, -apple-system, sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, monospace;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+.bg-glow {
+  position: fixed; inset: 0; pointer-events: none; z-index: 0;
+  background:
+    radial-gradient(ellipse 80% 50% at 20% -10%, rgba(99,102,241,0.18), transparent 50%),
+    radial-gradient(ellipse 60% 40% at 90% 10%, rgba(34,211,238,0.1), transparent 45%),
+    radial-gradient(ellipse 50% 30% at 50% 100%, rgba(167,139,250,0.08), transparent 40%);
+}
+.wrap {
+  position: relative; z-index: 1;
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 2rem 1.25rem 3rem;
+}
+.hero { margin-bottom: 2rem; }
+.hero-top {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem;
+}
+.logo { display: flex; align-items: center; gap: 0.9rem; }
+.logo-mark {
+  width: 48px; height: 48px; border-radius: 14px;
+  display: grid; place-items: center;
+  background: linear-gradient(135deg, #6366f1, #22d3ee);
+  box-shadow: 0 8px 24px rgba(99,102,241,0.35);
+  font-size: 1.25rem; color: #fff;
+}
+.logo h1 {
+  font-size: 1.5rem; font-weight: 700; letter-spacing: -0.02em;
+}
+.tagline { color: var(--muted); font-size: 0.85rem; }
+.status-pill {
+  display: inline-flex; align-items: center; gap: 0.45rem;
+  padding: 0.4rem 0.85rem; border-radius: 999px;
+  font-size: 0.8rem; font-weight: 600;
+  background: rgba(16,185,129,0.12);
+  color: var(--ok);
+  border: 1px solid rgba(16,185,129,0.25);
+}
+.status-pill .dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 0 3px rgba(16,185,129,0.25);
+  animation: pulse 2s ease infinite;
+}
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 3px rgba(16,185,129,0.25); }
+  50% { box-shadow: 0 0 0 6px rgba(16,185,129,0.08); }
+}
+.hero-desc {
+  color: var(--muted); font-size: 0.95rem; max-width: 42rem;
+}
+.hero-desc strong { color: var(--text); font-weight: 600; }
 
-        :root {
-            --primary: #6366f1;
-            --primary-dark: #4f46e5;
-            --secondary: #10b981;
-            --dark: #1f2937;
-            --darker: #111827;
-            --light: #f9fafb;
-            --gray: #6b7280;
-            --border: #374151;
-        }
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 1.25rem;
+}
+.empty {
+  grid-column: 1 / -1;
+  text-align: center; padding: 3rem;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+}
 
-        body {
-            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
-            background: linear-gradient(135deg, var(--darker) 0%, var(--dark) 100%);
-            color: var(--light);
-            min-height: 100vh;
-            line-height: 1.6;
-        }
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.35rem 1.35rem 1.2rem;
+  box-shadow: var(--shadow);
+  transition: border-color 0.2s, transform 0.2s;
+  display: flex; flex-direction: column; gap: 1rem;
+}
+.card:hover { border-color: var(--border-hover); transform: translateY(-2px); }
 
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 2rem;
-        }
+.card-head { display: flex; align-items: flex-start; gap: 0.9rem; }
+.card-icon {
+  width: 44px; height: 44px; border-radius: 12px;
+  display: grid; place-items: center; font-size: 1.1rem; flex-shrink: 0;
+}
+.card.hy2 .card-icon { background: rgba(34,211,238,0.12); color: var(--hy2); }
+.card.vless .card-icon { background: rgba(167,139,250,0.12); color: var(--vless); }
+.card.argo .card-icon { background: rgba(52,211,153,0.12); color: var(--argo); }
+.card-title { font-size: 1.15rem; font-weight: 650; letter-spacing: -0.01em; }
+.card-sub { color: var(--muted); font-size: 0.82rem; margin-top: 0.15rem; }
 
-        .header {
-            text-align: center;
-            margin-bottom: 3rem;
-        }
+.badges { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.badge {
+  font-size: 0.7rem; font-weight: 600; letter-spacing: 0.02em;
+  padding: 0.2rem 0.55rem; border-radius: 6px;
+  background: var(--surface2); color: var(--muted);
+  border: 1px solid var(--border);
+}
+.card.hy2 .badge.accent { color: var(--hy2); border-color: rgba(34,211,238,0.3); background: rgba(34,211,238,0.08); }
+.card.vless .badge.accent { color: var(--vless); border-color: rgba(167,139,250,0.3); background: rgba(167,139,250,0.08); }
+.card.argo .badge.accent { color: var(--argo); border-color: rgba(52,211,153,0.3); background: rgba(52,211,153,0.08); }
 
-        .header h1 {
-            font-size: 3rem;
-            font-weight: 700;
-            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            margin-bottom: 0.5rem;
-        }
+.section-label {
+  font-size: 0.72rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--muted); margin-bottom: 0.5rem;
+}
 
-        .header p {
-            color: var(--gray);
-            font-size: 1.2rem;
-        }
+.link-box {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 0.85rem;
+}
+.link-text {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  line-height: 1.5;
+  word-break: break-all;
+  color: #c5d0e6;
+  max-height: 4.5em;
+  overflow: hidden;
+  margin-bottom: 0.75rem;
+}
+.link-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
 
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
-            gap: 2rem;
-            margin-bottom: 2rem;
-        }
+.btn {
+  appearance: none; border: none; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; gap: 0.4rem;
+  font-family: var(--font); font-size: 0.82rem; font-weight: 600;
+  padding: 0.55rem 0.9rem; border-radius: 10px;
+  transition: background 0.15s, transform 0.1s, opacity 0.15s;
+}
+.btn:active { transform: scale(0.97); }
+.btn-primary {
+  background: var(--primary); color: #fff;
+}
+.btn-primary:hover { background: var(--primary2); }
+.btn-ghost {
+  background: transparent; color: var(--muted);
+  border: 1px solid var(--border);
+}
+.btn-ghost:hover { color: var(--text); border-color: rgba(255,255,255,0.18); background: rgba(255,255,255,0.04); }
+.btn.copied { background: var(--ok) !important; color: #fff !important; border-color: transparent !important; }
 
-        .card {
-            background: rgba(255, 255, 255, 0.05);
-            backdrop-filter: blur(10px);
-            border: 1px solid var(--border);
-            border-radius: 1rem;
-            padding: 2rem;
-            transition: all 0.3s ease;
-        }
+.base64-wrap { margin-top: 0.15rem; }
+.base64-toggle {
+  width: 100%; justify-content: space-between;
+  background: transparent; border: 1px solid var(--border);
+  color: var(--muted); border-radius: 10px; padding: 0.55rem 0.85rem;
+  font-size: 0.8rem; font-weight: 600; cursor: pointer;
+  display: flex; align-items: center; gap: 0.5rem;
+}
+.base64-toggle:hover { color: var(--text); border-color: rgba(255,255,255,0.15); }
+.base64-panel {
+  display: none; margin-top: 0.6rem;
+  background: #0a0e16; border: 1px solid var(--border);
+  border-radius: 10px; padding: 0.75rem;
+}
+.base64-panel.open { display: block; }
+.base64-panel code {
+  font-family: var(--mono); font-size: 0.68rem;
+  word-break: break-all; color: #9aa8c2; display: block;
+  margin-bottom: 0.65rem; line-height: 1.45;
+}
 
-        .card:hover {
-            transform: translateY(-5px);
-            border-color: var(--primary);
-            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
-        }
+.footer {
+  margin-top: 2.5rem; text-align: center;
+  color: var(--muted); font-size: 0.8rem;
+  display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 0.35rem;
+}
+.footer code {
+  font-family: var(--mono); font-size: 0.78rem;
+  background: var(--surface2); padding: 0.1rem 0.4rem; border-radius: 4px;
+  color: var(--text);
+}
+.sep { opacity: 0.4; }
 
-        .card-header {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-            margin-bottom: 1.5rem;
-        }
+.toast {
+  position: fixed; bottom: 1.5rem; left: 50%;
+  transform: translateX(-50%) translateY(120%);
+  background: #0f172a; color: #fff;
+  border: 1px solid rgba(16,185,129,0.4);
+  padding: 0.75rem 1.25rem; border-radius: 12px;
+  display: flex; align-items: center; gap: 0.5rem;
+  font-size: 0.9rem; font-weight: 600;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.45);
+  opacity: 0; transition: transform 0.25s ease, opacity 0.25s ease;
+  z-index: 1000; pointer-events: none;
+}
+.toast.show { transform: translateX(-50%) translateY(0); opacity: 1; }
+.toast i { color: var(--ok); }
 
-        .card-icon {
-            width: 50px;
-            height: 50px;
-            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
-            border-radius: 12px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 1.5rem;
-        }
-
-        .card-title {
-            font-size: 1.5rem;
-            font-weight: 600;
-        }
-
-        .card-subtitle {
-            color: var(--gray);
-            font-size: 0.9rem;
-        }
-
-        .link-item {
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid var(--border);
-            border-radius: 0.75rem;
-            padding: 1rem;
-            margin-bottom: 1rem;
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-            transition: all 0.3s ease;
-        }
-
-        .link-item:hover {
-            border-color: var(--primary);
-            background: rgba(99, 102, 241, 0.1);
-        }
-
-        .link-content {
-            flex: 1;
-            word-break: break-all;
-            font-family: 'Monaco', 'Consolas', monospace;
-            font-size: 0.85rem;
-            color: var(--light);
-        }
-
-        .copy-btn {
-            background: var(--primary);
-            color: white;
-            border: none;
-            padding: 0.5rem 1rem;
-            border-radius: 0.5rem;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            font-size: 0.9rem;
-            transition: all 0.3s ease;
-            white-space: nowrap;
-        }
-
-        .copy-btn:hover {
-            background: var(--primary-dark);
-            transform: scale(1.05);
-        }
-
-        .copy-btn.copied {
-            background: var(--secondary);
-        }
-
-        .base64-section {
-            margin-top: 1.5rem;
-        }
-
-        .base64-title {
-            font-size: 1.1rem;
-            font-weight: 600;
-            margin-bottom: 1rem;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-
-        .base64-content {
-            background: rgba(0, 0, 0, 0.3);
-            border: 1px solid var(--border);
-            border-radius: 0.75rem;
-            padding: 1rem;
-            font-family: 'Monaco', 'Consolas', monospace;
-            font-size: 0.8rem;
-            line-height: 1.4;
-            word-break: break-all;
-            margin-bottom: 1rem;
-            position: relative;
-        }
-
-        .protocol-badge {
-            background: var(--primary);
-            color: white;
-            padding: 0.25rem 0.75rem;
-            border-radius: 1rem;
-            font-size: 0.75rem;
-            font-weight: 600;
-            margin-bottom: 0.5rem;
-            display: inline-block;
-        }
-
-        .status-indicator {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-            padding: 0.25rem 0.75rem;
-            background: var(--secondary);
-            color: white;
-            border-radius: 1rem;
-            font-size: 0.75rem;
-            font-weight: 600;
-            margin-left: 1rem;
-        }
-
-        .status-indicator.offline {
-            background: #ef4444;
-        }
-
-        @media (max-width: 768px) {
-            .container {
-                padding: 1rem;
-            }
-
-            .grid {
-                grid-template-columns: 1fr;
-            }
-
-            .header h1 {
-                font-size: 2rem;
-            }
-
-            .link-item {
-                flex-direction: column;
-                align-items: stretch;
-            }
-
-            .copy-btn {
-                align-self: stretch;
-                justify-content: center;
-            }
-        }
-
-        .toast {
-            position: fixed;
-            bottom: 2rem;
-            right: 2rem;
-            background: var(--secondary);
-            color: white;
-            padding: 1rem 2rem;
-            border-radius: 0.75rem;
-            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.3);
-            transform: translateY(100px);
-            opacity: 0;
-            transition: all 0.3s ease;
-            z-index: 1000;
-        }
-
-        .toast.show {
-            transform: translateY(0);
-            opacity: 1;
-        }`;
+@media (max-width: 640px) {
+  .wrap { padding: 1.25rem 1rem 2rem; }
+  .logo h1 { font-size: 1.25rem; }
+  .link-actions .btn { flex: 1; }
+}
+`;
     }
 
-    /**
-     * Get JavaScript code
-     */
     static getScript() {
         return `
-        function copyToClipboard(text, button) {
-            if (navigator.clipboard && window.isSecureContext) {
-                navigator.clipboard.writeText(text).then(() => {
-                    showToast(button);
-                }).catch(err => {
-                    console.error('Failed to copy with navigator.clipboard: ', err);
-                    fallbackCopyToClipboard(text, button);
-                });
-            } else {
-                fallbackCopyToClipboard(text, button);
-            }
-        }
-
-        function fallbackCopyToClipboard(text, button) {
-            const textarea = document.createElement('textarea');
-            textarea.value = text;
-            textarea.style.position = 'fixed';
-            textarea.style.opacity = '0';
-            document.body.appendChild(textarea);
-            textarea.select();
-            try {
-                document.execCommand('copy');
-                showToast(button);
-            } catch (err) {
-                console.error('Failed to copy with execCommand: ', err);
-                alert('Failed to copy to clipboard. Please copy manually.');
-            } finally {
-                document.body.removeChild(textarea);
-            }
-        }
-
-        function showToast(button) {
-            const toast = document.getElementById('toast');
-            toast.classList.add('show');
-            setTimeout(() => {
-                toast.classList.remove('show');
-            }, 2000);
-
-            if (button) {
-                const originalText = button.innerHTML;
-                button.innerHTML = '<i class="fas fa-check"></i> Copied!';
-                button.classList.add('copied');
-                setTimeout(() => {
-                    button.innerHTML = originalText;
-                    button.classList.remove('copied');
-                }, 2000);
-            }
-        }
-
-        document.addEventListener('DOMContentLoaded', () => {
-            const cards = document.querySelectorAll('.card');
-            cards.forEach(card => {
-                card.addEventListener('click', (e) => {
-                    if (!e.target.closest('.copy-btn')) {
-                        card.style.transform = 'scale(0.98)';
-                        setTimeout(() => {
-                            card.style.transform = '';
-                        }, 150);
-                    }
-                });
-            });
-        });`;
+function copyText(text, btn) {
+  const done = () => {
+    const toast = document.getElementById('toast');
+    const t = document.getElementById('toast-text');
+    if (t) t.textContent = 'Copied to clipboard';
+    toast.classList.add('show');
+    setTimeout(() => toast.classList.remove('show'), 1800);
+    if (btn) {
+      const prev = btn.innerHTML;
+      btn.classList.add('copied');
+      btn.innerHTML = '<i class="fas fa-check"></i> Copied';
+      setTimeout(() => { btn.classList.remove('copied'); btn.innerHTML = prev; }, 1600);
+    }
+  };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(done).catch(() => fallback(text, done));
+  } else {
+    fallback(text, done);
+  }
+}
+function fallback(text, done) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.cssText = 'position:fixed;opacity:0;left:-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); done(); }
+  catch (e) { alert('Copy failed — select the text manually'); }
+  document.body.removeChild(ta);
+}
+function toggleBase64(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.toggle('open');
+}
+`;
     }
 
     /**
-     * Generate X configuration card
+     * Unified protocol card
      */
-    static generateXCard(links, base64) {
+    static generateProtocolCard({ id, title, subtitle, icon, accent, badges, links, base64 }) {
+        const link = links[0] || '';
+        const badgesHtml = (badges || []).map((b, i) =>
+            `<span class="badge${i === 0 ? ' accent' : ''}">${this.escapeHtml(b)}</span>`
+        ).join('');
+
+        // Safe embedding into onclick="copyText(<json>, this)"
+        const asJsArg = (s) => this.escapeHtml(JSON.stringify(s || ''));
+
         return `
-        <div class="card">
-            <div class="card-header">
-                <div class="card-icon">
-                    <i class="fas fa-bolt"></i>
-                </div>
-                <div>
-                    <div class="card-title">X Protocol</div>
-                    <div class="card-subtitle">VLESS Argo protocol</div>
-                </div>
-            </div>
-
-            <div class="protocol-badge">Connection Link</div>
-            ${links.length > 0 ? links.map(link => `
-                <div class="link-item">
-                    <div class="link-content">${link}</div>
-                    <button class="copy-btn" onclick="copyToClipboard('${link}', this)">
-                        <i class="fas fa-copy"></i> Copy
-                    </button>
-                </div>
-            `).join('') : '<div class="link-item"><div class="link-content">Links not generated yet</div></div>'}
-
-            <div class="base64-section">
-                <div class="base64-title">
-                    <i class="fas fa-qrcode"></i> Base64 Configuration
-                </div>
-                ${base64 ? `
-                    <div class="base64-content">${base64}</div>
-                    <button class="copy-btn" onclick="copyToClipboard('${base64}', this)">
-                        <i class="fas fa-copy"></i> Copy Base64
-                    </button>
-                ` : '<div class="base64-content">Subscription not generated yet</div>'}
-            </div>
-        </div>`;
-    }
-
-    /**
-     * Generate sb configuration card
-     */
-    static generateSboxCard(links, base64) {
-        return `
-        <div class="card">
-            <div class="card-header">
-                <div class="card-icon">
-                    <i class="fas fa-rocket"></i>
-                </div>
-                <div>
-                    <div class="card-title">HY2 Protocol</div>
-                    <div class="card-subtitle">High-performance protocol</div>
-                </div>
-            </div>
-
-            <div class="protocol-badge">Connection Link</div>
-            ${links.length > 0 ? links.map(link => `
-                <div class="link-item">
-                    <div class="link-content">${link}</div>
-                    <button class="copy-btn" onclick="copyToClipboard('${link}', this)">
-                        <i class="fas fa-copy"></i> Copy
-                    </button>
-                </div>
-            `).join('') : '<div class="link-item"><div class="link-content">Links not generated yet</div></div>'}
-
-            <div class="base64-section">
-                <div class="base64-title">
-                    <i class="fas fa-qrcode"></i> Base64 Configuration
-                </div>
-                ${base64 ? `
-                    <div class="base64-content">${base64}</div>
-                    <button class="copy-btn" onclick="copyToClipboard('${base64}', this)">
-                        <i class="fas fa-copy"></i> Copy Base64
-                    </button>
-                ` : '<div class="base64-content">Configuration not generated yet</div>'}
-            </div>
-        </div>`;
+<article class="card ${accent}">
+  <div class="card-head">
+    <div class="card-icon"><i class="fas ${icon}"></i></div>
+    <div>
+      <div class="card-title">${this.escapeHtml(title)}</div>
+      <div class="card-sub">${this.escapeHtml(subtitle)}</div>
+    </div>
+  </div>
+  <div class="badges">${badgesHtml}</div>
+  <div>
+    <div class="section-label">Connection link</div>
+    <div class="link-box">
+      <div class="link-text">${link ? this.escapeHtml(link) : 'Not available'}</div>
+      <div class="link-actions">
+        ${link ? `
+        <button class="btn btn-primary" type="button" onclick="copyText(${asJsArg(link)}, this)">
+          <i class="fas fa-copy"></i> Copy link
+        </button>
+        <button class="btn btn-ghost" type="button" onclick="copyText(${asJsArg(base64)}, this)" ${base64 ? '' : 'disabled'}>
+          <i class="fas fa-code"></i> Copy Base64
+        </button>` : '<span class="card-sub">Waiting for generation…</span>'}
+      </div>
+    </div>
+  </div>
+  ${base64 ? `
+  <div class="base64-wrap">
+    <button class="base64-toggle" type="button" onclick="toggleBase64('b64-${id}')">
+      <span><i class="fas fa-chevron-down"></i> Show Base64 / subscription</span>
+    </button>
+    <div class="base64-panel" id="b64-${id}">
+      <code>${this.escapeHtml(base64)}</code>
+      <button class="btn btn-ghost" type="button" onclick="copyText(${asJsArg(base64)}, this)">
+        <i class="fas fa-copy"></i> Copy Base64
+      </button>
+    </div>
+  </div>` : ''}
+</article>`;
     }
 }
 
@@ -1297,101 +1546,183 @@ class Application {
     static async initialize() {
         SystemUtils.ensureDirectory(CONFIG.FILE_PATH);
         SystemUtils.ensureDirectory(PATHS.SB_BASE_DIR);
+
+        // Persist UUID so restarts keep the same node id when UUID env is unset
+        const uuidFile = path.join(CONFIG.FILE_PATH, "uuid.txt");
+        if (!process.env.UUID && !process.env.SB_UUID) {
+            try {
+                if (fs.existsSync(uuidFile)) {
+                    const saved = fs.readFileSync(uuidFile, "utf8").trim();
+                    if (saved) {
+                        CONFIG.UUID = saved;
+                        CONFIG.SB_UUID = saved;
+                        if (!process.env.WS_PATH) CONFIG.WS_PATH = saved;
+                    }
+                } else {
+                    fs.writeFileSync(uuidFile, CONFIG.UUID);
+                }
+            } catch {
+                // ignore
+            }
+        }
+
+        // Persist OBFS password — critical: random each boot would break client links
+        const obfsFile = path.join(CONFIG.FILE_PATH, "obfs.txt");
+        if (CONFIG.SB_OBFS_PWD) {
+            try { fs.writeFileSync(obfsFile, CONFIG.SB_OBFS_PWD); } catch { /* ignore */ }
+        } else {
+            try {
+                if (fs.existsSync(obfsFile)) {
+                    CONFIG.SB_OBFS_PWD = fs.readFileSync(obfsFile, "utf8").trim();
+                }
+            } catch { /* ignore */ }
+            if (!CONFIG.SB_OBFS_PWD) {
+                CONFIG.SB_OBFS_PWD = crypto.randomBytes(16).toString("hex");
+                try { fs.writeFileSync(obfsFile, CONFIG.SB_OBFS_PWD); } catch { /* ignore */ }
+            }
+        }
     }
 
     /**
      * Start the application
      */
     static async start() {
-        Logger.header("🚀 XRAY-SING STARTUP");
-        
-        await this.initialize();
-        
-        // Apply system optimizations
-        SystemUtils.applySystemOptimizations();
+        Logger.header("Xray-Sing starting");
 
-        // Start sb
-        Logger.step("Starting sb server...");
-        state.sbProcess = await SbManager.initialize();
-        
-        if (state.sbProcess) {
-            await SbManager.generateLinks();
-        } else {
-            Logger.warning("sb failed to start, skipping link generation");
+        await this.initialize();
+        Logger.success(`Data directory: ${CONFIG.FILE_PATH}`);
+        Logger.info(`Public port: ${CONFIG.PORT}  |  Argo: ${CONFIG.ENABLE_ARGO ? "on" : "off"}`);
+
+        if (process.env.ENABLE_SYSCTL === "1" || process.env.ENABLE_SYSCTL === "true") {
+            SystemUtils.applySystemOptimizations();
         }
 
-        // Start X
-        Logger.step("Starting X server...");
-        XManager.createConfiguration();
-        await XManager.downloadAndRun();
+        Logger.step("[1/3] Starting sing-box (Hysteria2 + VLESS-WS)...");
+        state.sbProcess = await SbManager.initialize();
+        if (state.sbProcess) {
+            await SbManager.generateLinks();
+            Logger.success("sing-box is running");
+        } else {
+            Logger.error("sing-box failed to start");
+        }
 
-        // Wait for services to start
-        Logger.step("Waiting for services to start...");
-        await new Promise(resolve => setTimeout(resolve, 5000));
+        Logger.step("[2/3] Starting HTTP panel + WS proxy...");
+        await HttpServer.startServer();
+        Logger.success(`Panel ready on port ${CONFIG.PORT}`);
 
-        // Generate links
-        await XManager.extractDomains();
+        if (CONFIG.ENABLE_ARGO) {
+            Logger.step("[3/3] Starting Xray + Cloudflare Argo...");
+            XManager.createConfiguration();
+            await XManager.downloadAndRun();
+            await new Promise((resolve) => setTimeout(resolve, 3000));
+            await XManager.extractDomains();
+            if (state.xLinks.length > 0) {
+                Logger.success("Argo tunnel is ready");
+            } else {
+                Logger.warning("Argo link not ready (check boot.log)");
+            }
+        } else {
+            Logger.info("[3/3] Argo disabled (ENABLE_ARGO=0)");
+        }
 
-        // Start HTTP server
-        const app = HttpServer.createApp();
-        app.listen(CONFIG.PORT, () => {
-            Logger.success(`HTTP server running on port: ${CONFIG.PORT}`);
-            this.printAllLinks();
-        });
+        await this.printAllLinks();
     }
 
     /**
-     * Print all connection links
+     * Final summary for the user, then clear console after 3 minutes
      */
-    static printAllLinks() {
-        Logger.header("🔗 CONNECTION LINKS");
-        
-        console.log(`\n${COLORS.green}${COLORS.bright}📡 X LINKS:${COLORS.reset}`);
-        state.xLinks.forEach((link, index) => {
-            console.log(`  ${COLORS.cyan}${index + 1}.${COLORS.reset} ${COLORS.yellow}${link}${COLORS.reset}`);
-        });
-        
-        console.log(`\n${COLORS.blue}${COLORS.bright}🔗 X BASE64 (Subscription):${COLORS.reset}`);
-        console.log(`  ${COLORS.white}${state.xBase64}${COLORS.reset}`);
-        
-        if (state.sboxLinks.length > 0) {
-            console.log(`\n${COLORS.magenta}${COLORS.bright}⚡ HY2 LINKS:${COLORS.reset}`);
-            state.sboxLinks.forEach((link, index) => {
-                console.log(`  ${COLORS.cyan}${index + 1}.${COLORS.reset} ${COLORS.yellow}${link}${COLORS.reset}`);
-            });
-            
-            console.log(`\n${COLORS.blue}${COLORS.bright}🔗 HY2 BASE64:${COLORS.reset}`);
-            console.log(`  ${COLORS.white}${state.sboxBase64}${COLORS.reset}`);
-        } else {
-            console.log(`\n${COLORS.yellow}${COLORS.bright}⚠ HY2 LINKS: Not available${COLORS.reset}`);
-        }
-        
-        Logger.divider();
-        Logger.success("Services are running! Use the links above to connect.");
+    static async printAllLinks() {
+        const host = await SbManager.getServerHost();
+        const webUrl = `http://${host}:${CONFIG.PORT}/${CONFIG.SUB_PATH}`;
 
-        // Auto-clear terminal after 3 minutes
-        Logger.step(`Terminal will clear in 3 minutes...`);
-        setTimeout(() => {
-            process.stdout.write('\x1Bc');
-            process.stdout.write('\x1B[2J\x1B[0f');
-            console.log(`${COLORS.bright}${COLORS.green}Thank you for using this Xray-Sing!${COLORS.reset}\n`);
+        console.log("");
+        Logger.header("READY");
+        console.log(`${COLORS.bright}${COLORS.green}  All services are running${COLORS.reset}`);
+        console.log("");
+        console.log(`${COLORS.bright}  Web panel${COLORS.reset}`);
+        console.log(`  ${COLORS.yellow}${webUrl}${COLORS.reset}`);
+        console.log("");
+
+        if (state.sboxLinks.length > 0) {
+            console.log(`${COLORS.bright}  Hysteria2${COLORS.reset}`);
+            state.sboxLinks.forEach((link) => {
+                console.log(`  ${COLORS.white}${link}${COLORS.reset}`);
+            });
+            console.log("");
+        }
+
+        if (state.vlessWsLinks.length > 0) {
+            console.log(`${COLORS.bright}  VLESS-WS${COLORS.reset}`);
+            state.vlessWsLinks.forEach((link) => {
+                console.log(`  ${COLORS.white}${link}${COLORS.reset}`);
+            });
+            console.log("");
+        }
+
+        if (CONFIG.ENABLE_ARGO && state.xLinks.length > 0) {
+            console.log(`${COLORS.bright}  VLESS Argo${COLORS.reset}`);
+            state.xLinks.forEach((link) => {
+                console.log(`  ${COLORS.white}${link}${COLORS.reset}`);
+            });
+            console.log("");
+        }
+
+        console.log(`${COLORS.dim}  Links also saved to: ${path.join(CONFIG.FILE_PATH, "links.txt")}${COLORS.reset}`);
+        console.log(`${COLORS.dim}  Console will clear in 3 minutes...${COLORS.reset}`);
+        console.log(`${COLORS.bright}${COLORS.cyan}${"━".repeat(56)}${COLORS.reset}`);
+        console.log("");
+
+        try {
+            const linksFile = path.join(CONFIG.FILE_PATH, "links.txt");
+            const lines = [
+                `Web: ${webUrl}`,
+                "",
+                "=== Hysteria2 ===",
+                ...state.sboxLinks,
+                "",
+                "=== VLESS-WS ===",
+                ...state.vlessWsLinks,
+            ];
+            if (CONFIG.ENABLE_ARGO && state.xLinks.length) {
+                lines.push("", "=== X/Argo ===", ...state.xLinks);
+            }
+            fs.writeFileSync(linksFile, lines.join("\n") + "\n");
+        } catch {
+            // silent
+        }
+
+        // Keep timer on the event loop; clear with no further messages
+        const clearTimer = setTimeout(() => {
+            Logger.clearConsole();
         }, 3 * 60 * 1000);
+        // Do NOT unref — must fire while the server keeps running
+        if (clearTimer.ref) clearTimer.ref();
     }
 }
 
-// ========== ERROR HANDLING ==========
-process.on('uncaughtException', (error) => {
+// ========== ERROR HANDLING & SHUTDOWN ==========
+function shutdown(signal) {
+    try {
+        if (state.sbProcess && !state.sbProcess.killed) {
+            state.sbProcess.kill("SIGTERM");
+        }
+    } catch { /* ignore */ }
+    process.exit(signal === "SIGINT" ? 130 : 0);
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+process.on("uncaughtException", (error) => {
     Logger.error(`Uncaught Exception: ${error.message}`);
-    process.exit(1);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-    Logger.error(`Unhandled Rejection at: ${promise}, reason: ${reason}`);
-    process.exit(1);
+process.on("unhandledRejection", (reason) => {
+    Logger.error(`Unhandled Rejection: ${reason}`);
 });
 
 // ========== APPLICATION START ==========
-Application.start().catch(error => {
+Application.start().catch((error) => {
     Logger.error(`Application failed to start: ${error.message}`);
     process.exit(1);
 });
